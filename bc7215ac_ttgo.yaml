@@ -1,0 +1,267 @@
+# =============================================================================
+#  BC7215AC Universal Air Conditioner Controller
+#  ESPHome configuration for LILYGO TTGO T-Display (ESP32)
+#
+#  BC7215A chip wiring:
+#    GPIO25  -->  BC7215A RXD   (ESP32 TX sends commands to chip)
+#    GPIO33  <--  BC7215A TXD   (chip sends ACKs and reports to ESP32)
+#    GPIO27  -->  BC7215A MOD   (HIGH = pairing/learning mode)
+#    GPIO26  <--  BC7215A BUSY  (HIGH = chip is busy)
+#    3.3V    -->  VCC  |  GND --> GND
+#
+#  TTGO T-Display built-in buttons:
+#    GPIO0  = Right button  (active-LOW, also BOOT)
+#    GPIO35 = Left button   (active-LOW, input-only pin)
+# =============================================================================
+
+esphome:
+  name: bc7215ac-ttgo
+  friendly_name: "AC IR Controller"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ---- External component (local path) ----------------------------------------
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [bc7215ac]
+
+# ---- Core services ----------------------------------------------------------
+logger:
+  level: DEBUG
+  hardware_uart: UART0    # keep USB logging; BC7215A uses UART2
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  services:
+    - service: pair_ac
+      then:
+        - lambda: "id(ac_controller).start_pairing();"
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "BC7215AC Fallback"
+    password: "ChangeMe"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# ---- SPI bus for the ST7789 TFT (TTGO T-Display) ----------------------------
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+# ---- UART for the BC7215A chip ----------------------------------------------
+uart:
+  id: bc7215_uart
+  tx_pin: GPIO25    # ESP32 TX  -->  BC7215A RXD
+  rx_pin: GPIO33    # BC7215A TXD  -->  ESP32 RX
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+# ---- BC7215A MOD pin (GPIO switch) ------------------------------------------
+switch:
+  - platform: gpio
+    id: bc7215_mod
+    name: "BC7215A MOD Pin"
+    pin:
+      number: GPIO27
+      mode: OUTPUT
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+# ---- BC7215A BUSY pin + physical buttons ------------------------------------
+binary_sensor:
+  - platform: gpio
+    id: bc7215_busy
+    name: "BC7215A Busy"
+    pin:
+      number: GPIO26
+      mode: INPUT
+    internal: true
+
+  # Right button (GPIO0 - active-LOW, also BOOT button)
+  - platform: gpio
+    id: btn_right
+    name: "Right Button"
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    internal: true
+    filters:
+      - delayed_on: 20ms
+    on_click:
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - lambda: |-
+              // Short press: temperature +1 C
+              auto call = id(ac_controller).make_call();
+              float t = id(ac_controller).target_temperature;
+              if (isnan(t)) t = 24.0f;
+              call.set_target_temperature(std::min(t + 1.0f, 30.0f));
+              call.perform();
+      - min_length: 500ms
+        max_length: 3000ms
+        then:
+          - lambda: |-
+              // Long press: cycle fan speed  Auto -> Low -> Med -> High -> Auto
+              using namespace esphome::climate;
+              auto call = id(ac_controller).make_call();
+              auto fan = id(ac_controller).fan_mode;
+              if (!fan.has_value() || fan.value() == CLIMATE_FAN_AUTO)
+                call.set_fan_mode(CLIMATE_FAN_LOW);
+              else if (fan.value() == CLIMATE_FAN_LOW)
+                call.set_fan_mode(CLIMATE_FAN_MEDIUM);
+              else if (fan.value() == CLIMATE_FAN_MEDIUM)
+                call.set_fan_mode(CLIMATE_FAN_HIGH);
+              else
+                call.set_fan_mode(CLIMATE_FAN_AUTO);
+              call.perform();
+
+  # Left button (GPIO35 - input-only pin, active-LOW)
+  - platform: gpio
+    id: btn_left
+    name: "Left Button"
+    pin:
+      number: GPIO35
+      inverted: true
+      mode:
+        input: true
+    internal: true
+    filters:
+      - delayed_on: 20ms
+    on_click:
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - lambda: |-
+              // Short press: temperature -1 C
+              auto call = id(ac_controller).make_call();
+              float t = id(ac_controller).target_temperature;
+              if (isnan(t)) t = 24.0f;
+              call.set_target_temperature(std::max(t - 1.0f, 16.0f));
+              call.perform();
+      - min_length: 500ms
+        max_length: 3000ms
+        then:
+          - lambda: |-
+              // Long press: cycle climate mode  Off->Cool->Heat->Dry->Fan->Off
+              using namespace esphome::climate;
+              auto call = id(ac_controller).make_call();
+              auto mode = id(ac_controller).mode;
+              if (mode == CLIMATE_MODE_OFF)
+                call.set_mode(CLIMATE_MODE_COOL);
+              else if (mode == CLIMATE_MODE_COOL)
+                call.set_mode(CLIMATE_MODE_HEAT);
+              else if (mode == CLIMATE_MODE_HEAT)
+                call.set_mode(CLIMATE_MODE_DRY);
+              else if (mode == CLIMATE_MODE_DRY)
+                call.set_mode(CLIMATE_MODE_FAN_ONLY);
+              else
+                call.set_mode(CLIMATE_MODE_OFF);
+              call.perform();
+
+# ---- BC7215A Climate entity -------------------------------------------------
+climate:
+  - platform: bc7215ac
+    id: ac_controller
+    name: "Air Conditioner"
+    uart_id: bc7215_uart
+    mod_pin: bc7215_mod
+    busy_pin: bc7215_busy
+    visual:
+      min_temperature: 16
+      max_temperature: 30
+      temperature_step: 1
+
+# ---- ST7789 TFT Display (135 x 240, TTGO T-Display) ------------------------
+display:
+  - platform: st7789v
+    id: tft
+    model: TTGO TDisplay 135x240
+    cs_pin: GPIO5
+    dc_pin: GPIO16
+    reset_pin: GPIO23
+    backlight_pin: GPIO4
+    rotation: 0
+    update_interval: 500ms
+    lambda: |-
+      using namespace esphome::climate;
+
+      it.fill(Color::BLACK);
+
+      // Header
+      it.print(4, 2, id(fnt_s), Color(0x00, 0xBF, 0xFF), "BC7215A AC Controller");
+
+      // Mode label with colour coding
+      auto mode = id(ac_controller).mode;
+      const char *ms = "OFF";
+      Color mc = Color(0x66, 0x66, 0x66);
+      if (mode == CLIMATE_MODE_COOL)     { ms = "COOL"; mc = Color(0x00, 0xBF, 0xFF); }
+      if (mode == CLIMATE_MODE_HEAT)     { ms = "HEAT"; mc = Color(0xFF, 0x77, 0x00); }
+      if (mode == CLIMATE_MODE_DRY)      { ms = "DRY";  mc = Color(0x00, 0xFF, 0x88); }
+      if (mode == CLIMATE_MODE_FAN_ONLY) { ms = "FAN";  mc = Color(0xFF, 0xFF, 0x00); }
+      if (mode == CLIMATE_MODE_AUTO)     { ms = "AUTO"; mc = Color(0xFF, 0x88, 0xFF); }
+      it.printf(4, 20, id(fnt_m), mc, "Mode: %s", ms);
+
+      // Target temperature (large digits)
+      float tgt = id(ac_controller).target_temperature;
+      if (!isnan(tgt))
+        it.printf(4, 50, id(fnt_l), Color::WHITE, "%.0fC", tgt);
+      else
+        it.print(4, 50, id(fnt_l), Color::WHITE, "--C");
+
+      // Fan speed
+      auto fan = id(ac_controller).fan_mode;
+      const char *fs = "AUTO";
+      if (fan.has_value()) {
+        if (fan.value() == CLIMATE_FAN_LOW)    fs = "LOW";
+        if (fan.value() == CLIMATE_FAN_MEDIUM) fs = "MED";
+        if (fan.value() == CLIMATE_FAN_HIGH)   fs = "HIGH";
+      }
+      it.printf(4, 102, id(fnt_m), Color(0xAA, 0xAA, 0xFF), "Fan:  %s", fs);
+
+      // Button hints
+      it.print(4, 122, id(fnt_t), Color(0x55, 0x55, 0x55), "<sht: temp-   sht>: temp+");
+      it.print(4, 133, id(fnt_t), Color(0x55, 0x55, 0x55), "<lng: mode    lng>: fan");
+
+      // WiFi status
+      if (network::is_connected())
+        it.print(98, 2, id(fnt_t), Color(0x00, 0xFF, 0x00), "WiFi");
+      else
+        it.print(98, 2, id(fnt_t), Color(0xFF, 0x00, 0x00), "----");
+
+# ---- Fonts ------------------------------------------------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: fnt_t
+    size: 10
+  - file: "gfonts://Roboto"
+    id: fnt_s
+    size: 12
+  - file: "gfonts://Roboto"
+    id: fnt_m
+    size: 18
+  - file: "gfonts://Roboto"
+    id: fnt_l
+    size: 40

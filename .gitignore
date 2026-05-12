@@ -1,0 +1,13 @@
+# ESPHome build artefacts
+.esphome/
+.pioenvs/
+
+# Secrets - never commit real credentials
+secrets.yaml
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
