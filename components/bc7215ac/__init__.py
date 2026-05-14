@@ -1,7 +1,7 @@
 """BC7215A Universal A/C IR Controller - ESPHome external component.
 
 The climate platform schema and to_code live in climate.py.
-This file only declares the shared C++ namespace and class reference.
+This file just declares the shared namespace + class reference.
 """
 import esphome.codegen as cg
 from esphome.components import climate

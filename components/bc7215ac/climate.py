@@ -2,13 +2,13 @@
 
 ESPHome resolves 'platform: bc7215ac' inside a 'climate:' block by
 importing esphome.components.climate.bc7215ac, which maps to this file
-when the external_component path is configured.
+(components/bc7215ac/climate.py) when the external_component path is set.
 """
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import climate, uart, switch, binary_sensor
 from esphome.const import CONF_ID
-from . import bc7215ac_ns, BC7215ACClimate  # noqa: F401
+from . import bc7215ac_ns, BC7215ACClimate
 
 AUTO_LOAD = ["climate"]
 DEPENDENCIES = ["uart"]

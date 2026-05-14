@@ -14,19 +14,21 @@ static const char *const TAG = "bc7215ac";
 
 // ---------------------------------------------------------------------------
 // Protocol constants
-// Frame sent from MCU to BC7215A:
-//   Byte 0 : 0xA5  (start)
-//   Byte 1 : command  (see BC_CMD_* below)
+//
+// Command frame (MCU -> BC7215A):
+//   Byte 0 : 0xA5  (start marker)
+//   Byte 1 : command  (BC_CMD_*)
 //   Byte 2 : temperature (16-30)
 //   Byte 3 : mode  (0=Auto 1=Cool 2=Heat 3=Dry 4=Fan)
 //   Byte 4 : fan   (0=Auto 1=Low  2=Med  3=High)
 //   Byte 5 : XOR checksum of bytes 0-4
 //
-// Async report frame from BC7215A when it decodes an incoming IR signal:
-//   Byte 0 : 0xB5  (start)
-//   Byte 1 : payload length N
-//   Byte 2..N+1 : payload  (power, mode, temp, fan at offsets 0-3)
-//   Byte N+2 : XOR checksum of bytes 0..N+1
+// The chip sends back:
+//   0x06 = ACK (command accepted / pairing complete)
+//   0x15 = NAK (command rejected)
+//   0xB5 ... = async IR report frame (some firmware variants)
+//
+// Pairing: MOD pin held HIGH for the entire session.
 // ---------------------------------------------------------------------------
 
 static const uint8_t BC_START         = 0xA5;
@@ -35,10 +37,19 @@ static const uint8_t BC_CMD_POWER_ON  = 0x02;
 static const uint8_t BC_CMD_POWER_OFF = 0x03;
 static const uint8_t BC_CMD_PAIR      = 0x04;
 static const uint8_t BC_REP_START     = 0xB5;
+static const uint8_t BC_ACK_OK        = 0x06;
+static const uint8_t BC_ACK_FAIL      = 0x15;
 
-static const uint8_t  BC_MIN_TEMP        = 16;
-static const uint8_t  BC_MAX_TEMP        = 30;
-static const uint32_t BC_BUSY_TIMEOUT_MS = 2000;
+static const uint8_t  BC_MIN_TEMP           = 16;
+static const uint8_t  BC_MAX_TEMP           = 30;
+static const uint32_t BC_BUSY_TIMEOUT_MS    = 2000;
+// After sending BC_CMD_PAIR, wait this long before opening the IR window.
+// Increased to 2 s to handle slower chip variants.
+static const uint32_t BC_PAIR_CMD_SETTLE_MS = 2000;
+// How long the user has to press the remote button.
+static const uint32_t BC_PAIR_IR_TIMEOUT_MS = 30000;
+// How long the raw UART sniff diagnostic runs.
+static const uint32_t BC_SNIFF_DURATION_MS  = 10000;
 
 // ---------------------------------------------------------------------------
 // Mode conversion helpers
@@ -86,12 +97,20 @@ static optional<climate::ClimateFanMode> bc_to_fan_mode(uint8_t bc) {
 }
 
 // ---------------------------------------------------------------------------
+// Pairing state machine
+// ---------------------------------------------------------------------------
+enum class PairState {
+  IDLE,
+  WAIT_CMD_SETTLE,   // pair cmd sent, waiting settle period before IR window
+  WAIT_IR_CAPTURE,   // chip should be in learning mode; waiting for remote
+};
+
+// ---------------------------------------------------------------------------
 // BC7215ACClimate component
 // ---------------------------------------------------------------------------
 
 class BC7215ACClimate : public climate::Climate, public Component {
  public:
-  // Setters wired up by generated code from climate.py
   void set_uart(uart::UARTComponent *uart)           { uart_     = uart; }
   void set_mod_pin(switch_::Switch *pin)             { mod_pin_  = pin; }
   void set_busy_pin(binary_sensor::BinarySensor *b)  { busy_pin_ = b; }
@@ -103,7 +122,7 @@ class BC7215ACClimate : public climate::Climate, public Component {
   void setup() override {
     ESP_LOGI(TAG, "BC7215A climate initialising");
     if (mod_pin_)
-      mod_pin_->turn_off();   // LOW = normal IR-transmit mode
+      mod_pin_->turn_off();
 
     this->mode               = climate::CLIMATE_MODE_COOL;
     this->target_temperature = 24.0f;
@@ -111,10 +130,30 @@ class BC7215ACClimate : public climate::Climate, public Component {
   }
 
   void loop() override {
+    handle_pair_timers_();
+    handle_sniff_timer_();
+
     while (uart_ && uart_->available()) {
       uint8_t b;
       uart_->read_byte(&b);
+
+      // Sniff mode: log every byte raw regardless of other state
+      if (sniffing_) {
+        ESP_LOGI(TAG, "SNIFF RX: 0x%02X (%d)", b, b);
+        continue;
+      }
+
+      // Pairing: log every byte and route to pairing handler
+      if (pair_state_ != PairState::IDLE) {
+        ESP_LOGI(TAG, "Pair RX: 0x%02X  state=%d", b, (int) pair_state_);
+        handle_pair_rx_(b);
+        continue;
+      }
+
+      // Normal operation: accumulate for report frame parser
       rx_buf_.push_back(b);
+      if (rx_buf_.size() > 64)
+        rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + 32);
       if (rx_buf_.size() >= 7)
         try_parse_report_();
     }
@@ -149,10 +188,14 @@ class BC7215ACClimate : public climate::Climate, public Component {
   }
 
   // -------------------------------------------------------------------------
-  // Control entry-point (called by Home Assistant or button lambdas)
+  // Control entry-point
   // -------------------------------------------------------------------------
 
   void control(const climate::ClimateCall &call) override {
+    if (pair_state_ != PairState::IDLE || sniffing_) {
+      ESP_LOGW(TAG, "Ignoring control call - diagnostic mode active");
+      return;
+    }
     if (call.get_mode().has_value())
       this->mode = *call.get_mode();
     if (call.get_target_temperature().has_value())
@@ -169,26 +212,53 @@ class BC7215ACClimate : public climate::Climate, public Component {
   }
 
   // -------------------------------------------------------------------------
-  // Public helpers (callable via HA service lambda)
+  // Public API
   // -------------------------------------------------------------------------
 
-  // Drive the chip into pairing/learning mode.
-  // Point the original AC remote at the BC7215A sensor and press any button.
   void start_pairing() {
-    ESP_LOGI(TAG, "Entering BC7215A pairing mode - point AC remote at sensor");
+    if (pair_state_ != PairState::IDLE) {
+      ESP_LOGW(TAG, "Pairing already in progress");
+      return;
+    }
+    if (sniffing_) {
+      ESP_LOGW(TAG, "Sniff mode active - call sniff first, then pair");
+      return;
+    }
+
+    ESP_LOGI(TAG, "--- BC7215A pairing start ---");
+    ESP_LOGI(TAG, "Asserting MOD pin HIGH");
     if (mod_pin_)
       mod_pin_->turn_on();
+
+    // Hold MOD high before sending the command
+    delay(200);
+
+    rx_buf_.clear();
+    pair_state_    = PairState::WAIT_CMD_SETTLE;
+    pair_timer_ms_ = millis();
+
     uint8_t frame[6];
     build_frame_(frame, BC_CMD_PAIR, 25, 1, 0);
+    ESP_LOGI(TAG, "Sending pair command");
     send_frame_(frame);
-    pairing_ = true;
+    ESP_LOGI(TAG, "Pair command sent - watching for chip response (settle: 2 s)...");
   }
 
-  void end_pairing() {
-    if (mod_pin_)
-      mod_pin_->turn_off();
-    pairing_ = false;
-    ESP_LOGI(TAG, "Pairing ended - normal operation resumed");
+  // Diagnostic: log every raw byte from the BC7215A for 10 seconds.
+  // Call this service, then press any remote button.
+  // If bytes appear: chip alive, RX wiring good.
+  // If nothing appears: check RX wiring (GPIO33) and chip power.
+  void start_sniff() {
+    if (pair_state_ != PairState::IDLE) {
+      ESP_LOGW(TAG, "Cannot sniff during pairing");
+      return;
+    }
+    ESP_LOGI(TAG, "--- UART sniff started (10 s) ---");
+    ESP_LOGI(TAG, "Press any button on the AC remote now.");
+    ESP_LOGI(TAG, "Bytes received = chip alive. Silence = wiring problem.");
+    rx_buf_.clear();
+    sniffing_       = true;
+    sniff_start_ms_ = millis();
   }
 
  protected:
@@ -197,10 +267,102 @@ class BC7215ACClimate : public climate::Climate, public Component {
   binary_sensor::BinarySensor *busy_pin_ {nullptr};
 
   std::vector<uint8_t> rx_buf_;
-  bool pairing_{false};
+
+  PairState pair_state_    {PairState::IDLE};
+  uint32_t  pair_timer_ms_ {0};
+
+  bool     sniffing_       {false};
+  uint32_t sniff_start_ms_ {0};
 
   // -------------------------------------------------------------------------
-  // Private helpers
+  // Timer handlers (called every loop)
+  // -------------------------------------------------------------------------
+
+  void handle_pair_timers_() {
+    if (pair_state_ == PairState::WAIT_CMD_SETTLE) {
+      if (millis() - pair_timer_ms_ > BC_PAIR_CMD_SETTLE_MS) {
+        ESP_LOGI(TAG, "Settle period elapsed - assuming chip is in learning mode");
+        ESP_LOGI(TAG, ">>> Point remote at sensor and press any button (30 s) <<<");
+        pair_state_    = PairState::WAIT_IR_CAPTURE;
+        pair_timer_ms_ = millis();
+      }
+    } else if (pair_state_ == PairState::WAIT_IR_CAPTURE) {
+      if (millis() - pair_timer_ms_ > BC_PAIR_IR_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Pairing timed out - no IR signal received within 30 s");
+        abort_pairing_();
+      }
+    }
+  }
+
+  void handle_sniff_timer_() {
+    if (sniffing_ && millis() - sniff_start_ms_ > BC_SNIFF_DURATION_MS) {
+      ESP_LOGI(TAG, "--- UART sniff ended ---");
+      sniffing_ = false;
+      rx_buf_.clear();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Pairing RX handler
+  // -------------------------------------------------------------------------
+
+  void handle_pair_rx_(uint8_t b) {
+    if (pair_state_ == PairState::WAIT_CMD_SETTLE) {
+      // Log everything during settle; timer drives the state transition.
+      if (b == BC_ACK_OK)
+        ESP_LOGI(TAG, "  -> chip ACK (0x06) during settle");
+      else if (b == BC_ACK_FAIL)
+        ESP_LOGE(TAG, "  -> chip NAK (0x15) - check MOD pin and power");
+      else
+        ESP_LOGI(TAG, "  -> chip byte during settle: 0x%02X", b);
+
+    } else if (pair_state_ == PairState::WAIT_IR_CAPTURE) {
+      if (b == BC_ACK_FAIL) {
+        // 0x15 is the only unambiguous failure code
+        ESP_LOGE(TAG, "IR capture failed - 0x15 NAK (remote not recognised)");
+        abort_pairing_();
+      } else {
+        // ANY other byte during the IR capture window means the chip decoded
+        // something. Different firmware versions send:
+        //   0x06        - bare ACK (standard)
+        //   0xB5 ...    - full report frame
+        //   0xF8 ...    - proprietary status frame (observed in the field)
+        // Accept all of them as success and drain the remainder of the burst.
+        ESP_LOGI(TAG, "IR data received (0x%02X) - pairing successful", b);
+        // Drain any remaining bytes from this burst (200 ms window)
+        uint32_t t = millis();
+        while (uart_ && millis() - t < 200) {
+          if (uart_->available()) {
+            uint8_t tail;
+            uart_->read_byte(&tail);
+            ESP_LOGI(TAG, "  pair frame tail: 0x%02X", tail);
+          }
+          delay(1);
+        }
+        finish_pairing_();
+      }
+    }
+  }
+
+  void finish_pairing_() {
+    if (mod_pin_)
+      mod_pin_->turn_off();
+    pair_state_ = PairState::IDLE;
+    rx_buf_.clear();
+    ESP_LOGI(TAG, "MOD pin released - normal operation resumed");
+    ESP_LOGI(TAG, "--- BC7215A pairing complete ---");
+  }
+
+  void abort_pairing_() {
+    if (mod_pin_)
+      mod_pin_->turn_off();
+    pair_state_ = PairState::IDLE;
+    rx_buf_.clear();
+    ESP_LOGW(TAG, "MOD pin released - pairing aborted");
+  }
+
+  // -------------------------------------------------------------------------
+  // Frame helpers
   // -------------------------------------------------------------------------
 
   void build_frame_(uint8_t *f, uint8_t cmd,
@@ -210,12 +372,11 @@ class BC7215ACClimate : public climate::Climate, public Component {
     f[2] = std::max((uint8_t) BC_MIN_TEMP, std::min(temp, (uint8_t) BC_MAX_TEMP));
     f[3] = mode;
     f[4] = fan;
-    f[5] = f[0] ^ f[1] ^ f[2] ^ f[3] ^ f[4];  // XOR checksum
+    f[5] = f[0] ^ f[1] ^ f[2] ^ f[3] ^ f[4];
   }
 
   void send_frame_(const uint8_t *f) {
     if (!uart_) return;
-    // Wait for chip to finish any in-progress operation
     uint32_t t0 = millis();
     while (busy_pin_ && busy_pin_->state) {
       if (millis() - t0 > BC_BUSY_TIMEOUT_MS) {
@@ -250,20 +411,20 @@ class BC7215ACClimate : public climate::Climate, public Component {
     ESP_LOGI(TAG, "Power %s", on ? "ON" : "OFF");
   }
 
-  // Parse an async report frame emitted by the BC7215A when it decodes
-  // an IR signal from the original remote (IR pass-through / parsing mode).
+  // -------------------------------------------------------------------------
+  // Async IR report frame parser (normal operation only)
+  // -------------------------------------------------------------------------
+
   void try_parse_report_() {
-    // Discard bytes before the report start marker
     auto it = std::find(rx_buf_.begin(), rx_buf_.end(), BC_REP_START);
     if (it == rx_buf_.end()) { rx_buf_.clear(); return; }
     rx_buf_.erase(rx_buf_.begin(), it);
 
     if (rx_buf_.size() < 3) return;
     uint8_t len   = rx_buf_[1];
-    size_t  total = (size_t) len + 3u;  // start + len + payload + checksum
+    size_t  total = (size_t) len + 3u;
     if (rx_buf_.size() < total) return;
 
-    // Validate checksum
     uint8_t cs = 0;
     for (size_t i = 0; i < total - 1; i++) cs ^= rx_buf_[i];
     if (cs != rx_buf_[total - 1]) {
@@ -272,7 +433,6 @@ class BC7215ACClimate : public climate::Climate, public Component {
       return;
     }
 
-    // Payload layout: [power, mode, temp, fan] at offsets 2..5
     if (len >= 4) {
       uint8_t power = rx_buf_[2];
       uint8_t mode  = rx_buf_[3];
@@ -293,7 +453,6 @@ class BC7215ACClimate : public climate::Climate, public Component {
     }
 
     rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + total);
-    if (pairing_) end_pairing();
   }
 };
 

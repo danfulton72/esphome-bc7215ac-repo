@@ -60,7 +60,7 @@ time:
   - platform: homeassistant
     id: ha_time
 
-# ---- SPI bus for the ST7789 TFT (TTGO T-Display) ----------------------------
+# ── SPI for the ST7789 TFT (TTGO T-Display) ──────────────────
 spi:
   clk_pin: GPIO18
   mosi_pin: GPIO19
@@ -74,7 +74,7 @@ uart:
   data_bits: 8
   parity: NONE
   stop_bits: 1
-
+ 
 # ---- BC7215A MOD pin (GPIO switch) ------------------------------------------
 switch:
   - platform: gpio
@@ -85,7 +85,7 @@ switch:
       mode: OUTPUT
     restore_mode: ALWAYS_OFF
     internal: true
-
+ 
 # ---- BC7215A BUSY pin + physical buttons ------------------------------------
 binary_sensor:
   - platform: gpio
@@ -95,7 +95,7 @@ binary_sensor:
       number: GPIO26
       mode: INPUT
     internal: true
-
+ 
   # Right button (GPIO0 - active-LOW, also BOOT button)
   - platform: gpio
     id: btn_right
@@ -137,7 +137,7 @@ binary_sensor:
               else
                 call.set_fan_mode(CLIMATE_FAN_AUTO);
               call.perform();
-
+ 
   # Left button (GPIO35 - input-only pin, active-LOW)
   - platform: gpio
     id: btn_left
@@ -180,7 +180,7 @@ binary_sensor:
               else
                 call.set_mode(CLIMATE_MODE_OFF);
               call.perform();
-
+ 
 # ---- BC7215A Climate entity -------------------------------------------------
 climate:
   - platform: bc7215ac
@@ -193,7 +193,7 @@ climate:
       min_temperature: 16
       max_temperature: 30
       temperature_step: 1
-
+ 
 # ---- ST7789 TFT Display (135 x 240, TTGO T-Display) ------------------------
 display:
   - platform: st7789v
@@ -207,12 +207,12 @@ display:
     update_interval: 500ms
     lambda: |-
       using namespace esphome::climate;
-
+ 
       it.fill(Color::BLACK);
-
+ 
       // Header
       it.print(4, 2, id(fnt_s), Color(0x00, 0xBF, 0xFF), "BC7215A AC Controller");
-
+ 
       // Mode label with colour coding
       auto mode = id(ac_controller).mode;
       const char *ms = "OFF";
@@ -223,14 +223,14 @@ display:
       if (mode == CLIMATE_MODE_FAN_ONLY) { ms = "FAN";  mc = Color(0xFF, 0xFF, 0x00); }
       if (mode == CLIMATE_MODE_AUTO)     { ms = "AUTO"; mc = Color(0xFF, 0x88, 0xFF); }
       it.printf(4, 20, id(fnt_m), mc, "Mode: %s", ms);
-
+ 
       // Target temperature (large digits)
       float tgt = id(ac_controller).target_temperature;
       if (!isnan(tgt))
         it.printf(4, 50, id(fnt_l), Color::WHITE, "%.0fC", tgt);
       else
         it.print(4, 50, id(fnt_l), Color::WHITE, "--C");
-
+ 
       // Fan speed
       auto fan = id(ac_controller).fan_mode;
       const char *fs = "AUTO";
@@ -240,17 +240,17 @@ display:
         if (fan.value() == CLIMATE_FAN_HIGH)   fs = "HIGH";
       }
       it.printf(4, 102, id(fnt_m), Color(0xAA, 0xAA, 0xFF), "Fan:  %s", fs);
-
+ 
       // Button hints
       it.print(4, 122, id(fnt_t), Color(0x55, 0x55, 0x55), "<sht: temp-   sht>: temp+");
       it.print(4, 133, id(fnt_t), Color(0x55, 0x55, 0x55), "<lng: mode    lng>: fan");
-
+ 
       // WiFi status
       if (network::is_connected())
         it.print(98, 2, id(fnt_t), Color(0x00, 0xFF, 0x00), "WiFi");
       else
         it.print(98, 2, id(fnt_t), Color(0xFF, 0x00, 0x00), "----");
-
+ 
 # ---- Fonts ------------------------------------------------------------------
 font:
   - file: "gfonts://Roboto"
